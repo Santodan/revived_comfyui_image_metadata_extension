@@ -22,23 +22,310 @@ class OutputCacheCompat:
         self._cache = cache
 
     def get_output_cache(self, input_unique_id, unique_id=None):
-        # For version 0.3.67 and newer
         if hasattr(self._cache, "get"):
             return self._cache.get(input_unique_id)
         return getattr(self._cache, "outputs", {}).get(input_unique_id, None)
 
     def get(self, input_unique_id):
-        # For version 0.3.66 and lower
         if hasattr(self._cache, "get"):
             return self._cache.get(input_unique_id)
         return getattr(self._cache, "outputs", {}).get(input_unique_id, None)
-    
-    # fix: https://github.com/edelvarden/comfyui_image_metadata_extension/issues/67
+
     def get_cache(self, input_unique_id, unique_id=None):
         if hasattr(self._cache, "get_cache"):
             return self._cache.get_cache(input_unique_id, unique_id)
         return self.get_output_cache(input_unique_id, unique_id)
 
+
+# ---------------------------------------------------------------------------
+# Helpers to walk the prompt graph and extract raw text regardless of how
+# many indirection levels (wired text nodes, concat nodes, etc.) there are.
+# ---------------------------------------------------------------------------
+
+# Node class names that are text-concatenation / joining nodes.
+_CONCAT_CLASS_HINTS = [
+    "concat", "join", "combine", "mixer",
+    "string", "text",        # many "TextConcatenate", "StringJoin" nodes
+]
+
+# Input key names that carry text payloads inside concat-style nodes.
+_TEXT_KEY_HINTS = [
+    "text", "string", "input", "value", "prompt",
+    "text1", "text2", "text_a", "text_b",
+    "string1", "string2",
+    "positive_prompt", "negative_prompt",
+]
+
+
+def _is_link(value):
+    """Return True when *value* looks like a ComfyUI node-output link [node_id, index]."""
+    return (
+        isinstance(value, list)
+        and len(value) == 2
+        and isinstance(value[0], (str, int))
+        and isinstance(value[1], int)
+    )
+
+
+def _resolve_text_from_graph(value, prompt, outputs, _visited=None, batch_index=0):
+    """
+    Recursively resolve *value* to a plain string by walking the prompt graph.
+
+    *value* can be:
+      - A plain string  → returned as-is.
+      - A link          → follow to the source node and recurse.
+      - None            → returns None.
+
+    *batch_index* selects which entry to use when a cache slot holds a list
+    of strings (i.e. when a list was fed into the node, generating one image
+    per entry).  Pass the current image's position in the batch so each image
+    gets its own prompt text rather than always the first one.
+
+    The function tries (in order):
+      1. The execution cache (already-evaluated output).
+      2. A ``text`` / ``string`` / similar field on the source node's inputs
+         (handles CLIPTextEncode with a wired-in text node).
+      3. Concatenation / joining nodes whose text inputs are all resolved
+         recursively and joined with the node's separator.
+
+    *_visited* prevents infinite loops on cyclic graphs.
+    """
+    if _visited is None:
+        _visited = set()
+
+    if value is None:
+        return None
+
+    # Already a plain string – nothing to resolve.
+    if isinstance(value, str):
+        return value if value.strip() else None
+
+    # Unwrap single-element lists that ComfyUI sometimes produces.
+    if isinstance(value, (list, tuple)) and len(value) == 1:
+        return _resolve_text_from_graph(value[0], prompt, outputs, _visited, batch_index)
+
+    if not _is_link(value):
+        return None
+
+    node_id = str(value[0])
+    out_idx = value[1]
+
+    if node_id in _visited:
+        return None
+    _visited = _visited | {node_id}
+
+    # ── 1. Try the execution cache first ────────────────────────────────────
+    if outputs is not None:
+        cached = outputs.get(node_id)
+        if cached is not None:
+            # cached is a list of output-slot values
+            if isinstance(cached, (list, tuple)) and len(cached) > out_idx:
+                slot = cached[out_idx]
+                # When the slot itself is a list, each entry corresponds to one
+                # image in the batch — pick the right one via batch_index.
+                if isinstance(slot, list):
+                    idx = min(batch_index, len(slot) - 1)
+                    slot = slot[idx]
+                if isinstance(slot, str) and slot.strip():
+                    return slot
+                # slot might itself be a link
+                resolved = _resolve_text_from_graph(slot, prompt, outputs, _visited, batch_index)
+                if resolved:
+                    return resolved
+
+    # ── 2. Walk the graph node ───────────────────────────────────────────────
+    node = prompt.get(node_id)
+    if node is None:
+        return None
+
+    node_inputs = node.get("inputs", {})
+    class_type = node.get("class_type", "").lower()
+
+    # Direct text field on this node (e.g. CLIPTextEncode whose "text" is
+    # a hard-coded string, or a primitive String node).
+    for key in ("text", "string", "value", "val", "prompt",
+                "positive_prompt", "negative_prompt"):
+        raw = node_inputs.get(key)
+        if raw is None:
+            continue
+        if isinstance(raw, str) and raw.strip():
+            return raw
+        if _is_link(raw):
+            resolved = _resolve_text_from_graph(raw, prompt, outputs, _visited)
+            if resolved:
+                return resolved
+
+    # ── 3. Concatenation / joining nodes ────────────────────────────────────
+    is_concat = any(hint in class_type for hint in _CONCAT_CLASS_HINTS)
+    if is_concat:
+        # Collect all text-like input keys in stable order.
+        candidate_keys = sorted(
+            (k for k in node_inputs if any(h in k.lower() for h in _TEXT_KEY_HINTS)),
+            key=lambda k: (re.sub(r'\d+', '', k),
+                           int(re.search(r'\d+', k).group()) if re.search(r'\d+', k) else 0)
+        )
+        parts = []
+        for k in candidate_keys:
+            resolved = _resolve_text_from_graph(node_inputs[k], prompt, outputs, _visited, batch_index)
+            if resolved:
+                parts.append(resolved)
+
+        if parts:
+            sep_raw = node_inputs.get("delimiter", node_inputs.get("separator", " "))
+            sep = sep_raw.replace("\\n", "\n") if isinstance(sep_raw, str) else " "
+            return sep.join(parts)
+
+    # ── 4. Fallback: scan only text-hinted input keys, never model/clip/vae ──
+    _NON_TEXT_KEYS = {"model", "clip", "vae", "control_net", "image", "mask",
+                      "latent", "latent_image", "samples", "upscale_model",
+                      "positive", "negative", "conditioning"}
+    for key, raw in node_inputs.items():
+        if key.lower() in _NON_TEXT_KEYS:
+            continue
+        if _is_link(raw):
+            # Only follow if the key name hints at text content
+            if any(h in key.lower() for h in _TEXT_KEY_HINTS):
+                resolved = _resolve_text_from_graph(raw, prompt, outputs, _visited, batch_index)
+                if resolved:
+                    return resolved
+
+    return None
+
+
+def _resolve_clip_text_encode_prompt(node_id, prompt, outputs, batch_index=0):
+    """
+    Given a CLIPTextEncode node's *node_id*, return its resolved text string.
+
+    The CLIPTextEncode node has a single ``text`` input which may be:
+      - A hard-coded string.
+      - A link to another node (primitive, text node, concat node, …).
+      - A list of strings when a list was wired in (one entry per batch image).
+    """
+    node = prompt.get(str(node_id))
+    if node is None:
+        return None
+    raw = node.get("inputs", {}).get("text")
+    if raw is None:
+        return None
+    # Hard-coded string directly in the node
+    if isinstance(raw, str):
+        return raw if raw.strip() else None
+    # List of strings wired directly (rare but possible)
+    if isinstance(raw, list) and raw and isinstance(raw[0], str):
+        idx = min(batch_index, len(raw) - 1)
+        return raw[idx] if raw[idx].strip() else None
+    return _resolve_text_from_graph(raw, prompt, outputs, batch_index=batch_index)
+
+
+def _follow_conditioning_to_clip_text(cond_value, prompt, outputs, _depth=0, batch_index=0):
+    """
+    Follow a conditioning link chain until we reach a CLIPTextEncode and
+    resolve its text.
+
+    *batch_index* is forwarded all the way down so that when the text source
+    is a list (one string per batch image), the correct entry is selected.
+    """
+    if _depth > 20:  # safety limit
+        return None
+    if not _is_link(cond_value):
+        return None
+
+    src_id = str(cond_value[0])
+    src_node = prompt.get(src_id)
+    if src_node is None:
+        return None
+
+    src_class = src_node.get("class_type", "")
+    src_inputs = src_node.get("inputs", {})
+
+    # ── Direct CLIPTextEncode ─────────────────────────────────────────────
+    if src_class == "CLIPTextEncode":
+        return _resolve_clip_text_encode_prompt(src_id, prompt, outputs, batch_index)
+
+    # ── Node with its own text field (e.g. some conditioning wrappers) ───
+    for k in ("text", "string", "prompt"):
+        raw = src_inputs.get(k)
+        if raw is not None:
+            resolved = _resolve_text_from_graph(raw, prompt, outputs, batch_index=batch_index)
+            if resolved:
+                return resolved
+
+    # ── Conditioning passthrough: follow the *first* conditioning input ──
+    PASSTHROUGH_KEYS = ("conditioning", "cond", "conditioning_1", "conditioning_2")
+    for k in PASSTHROUGH_KEYS:
+        if k in src_inputs:
+            result = _follow_conditioning_to_clip_text(
+                src_inputs[k], prompt, outputs, _depth + 1, batch_index
+            )
+            if result:
+                return result
+
+    # ── Last resort: any link-valued input that isn't a model/image slot ─
+    _SKIP_KEYS = {"model", "clip", "vae", "image", "mask", "latent",
+                  "latent_image", "samples", "positive", "negative"}
+    for k, v in src_inputs.items():
+        if k in _SKIP_KEYS:
+            continue
+        if _is_link(v):
+            result = _follow_conditioning_to_clip_text(v, prompt, outputs, _depth + 1, batch_index)
+            if result:
+                return result
+
+    return None
+
+
+def _find_prompt_texts(prompt, outputs, batch_index=0):
+    """
+    Walk the prompt graph to find the positive and negative prompt strings.
+
+    Looks for a KSampler-like node (by class name OR by having both
+    ``positive`` and ``negative`` conditioning inputs plus a sampler-like
+    input such as ``seed``, ``steps``, or ``noise_seed``).  From there it
+    follows each conditioning chain independently so the two polarities
+    never get mixed up.
+    """
+    SAMPLER_CLASSES = {
+        "KSampler", "KSamplerAdvanced", "SamplerCustom",
+        "KSamplerSelect", "KSampler_inspire",
+        "KSamplerAdvancedPipe", "KSamplerPipe",
+        "FluxKSampler", "FluxSampler",
+        "Sampler",
+    }
+    # Inputs that indicate this node is a sampler even if the class name is unknown
+    SAMPLER_HINT_KEYS = {"seed", "steps", "cfg", "sampler_name", "noise_seed", "denoise"}
+
+    for node_id, node in prompt.items():
+        class_type = node.get("class_type", "")
+        node_inputs = node.get("inputs", {})
+
+        is_sampler = (
+            class_type in SAMPLER_CLASSES
+            or (
+                "positive" in node_inputs
+                and "negative" in node_inputs
+                and bool(SAMPLER_HINT_KEYS & set(node_inputs.keys()))
+            )
+        )
+        if not is_sampler:
+            continue
+
+        # Resolve each polarity independently — critical to keep them separate
+        pos_text = _follow_conditioning_to_clip_text(
+            node_inputs.get("positive"), prompt, outputs, batch_index=batch_index
+        )
+        neg_text = _follow_conditioning_to_clip_text(
+            node_inputs.get("negative"), prompt, outputs, batch_index=batch_index
+        )
+
+        if pos_text or neg_text:
+            return pos_text, neg_text
+
+    return None, None
+
+
+# ---------------------------------------------------------------------------
+# Main Capture class (original logic preserved, prompt resolution patched)
+# ---------------------------------------------------------------------------
 
 class Capture:
     @classmethod
@@ -59,6 +346,8 @@ class Capture:
 
         for node_id, obj in prompt.items():
             class_type = obj["class_type"]
+            if class_type not in NODE_CLASS_MAPPINGS:
+                continue
             obj_class = NODE_CLASS_MAPPINGS[class_type]
             node_inputs = obj["inputs"]
 
@@ -66,23 +355,19 @@ class Capture:
                 node_inputs, obj_class, node_id, outputs, DynamicPrompt(prompt), extra_data
             )
 
-            # Process field data mappings for the captured inputs
             for node_class, metas in CAPTURE_FIELD_LIST.items():
                 if class_type != node_class:
                     continue
 
                 for meta, field_data in metas.items():
-                    # Skip invalidated nodes
                     if field_data.get("validate") and not field_data["validate"](
                         node_id, obj, prompt, extra_data, outputs, input_data
                     ):
                         continue
 
-                    # Initialize list for meta if not exists
                     if meta not in inputs:
                         inputs[meta] = []
 
-                    # Get field value or selector
                     value = field_data.get("value")
                     if value is not None:
                         inputs[meta].append((node_id, value))
@@ -94,9 +379,17 @@ class Capture:
                         cls._append_value(inputs, meta, node_id, v)
                         continue
 
-                    # Fetch and process value from field_name
                     field_name = field_data["field_name"]
                     value = input_data[0].get(field_name)
+
+                    # ── KEY FIX ──────────────────────────────────────────────
+                    # If get_input_data returned a link reference instead of a
+                    # resolved string (happens when the text input is wired),
+                    # resolve it ourselves by walking the graph.
+                    if _is_link(value):
+                        value = _resolve_text_from_graph(value, prompt, outputs)
+                    # ─────────────────────────────────────────────────────────
+
                     if value is not None:
                         format_func = field_data.get("format")
                         v = cls._apply_formatting(value, input_data, format_func)
@@ -106,7 +399,6 @@ class Capture:
 
     @staticmethod
     def _apply_formatting(value, input_data, format_func):
-        """Apply formatting to a value using the given format function."""
         if isinstance(value, list) and len(value) > 0:
             value = value[0]
         if format_func:
@@ -115,7 +407,6 @@ class Capture:
 
     @staticmethod
     def _append_value(inputs, meta, node_id, value):
-        """Append processed value to the inputs list."""
         if isinstance(value, list):
             for x in value:
                 inputs[meta].append((node_id, x))
@@ -128,7 +419,6 @@ class Capture:
         def clean_name(n):
             return os.path.splitext(os.path.basename(n))[0].replace('\\', '_').replace('/', '_').replace(' ', '_').replace(':', '_')
 
-        # Regex to match <lora:name:weight>, based on https://github.com/civitai/civitai/blob/main/src/utils/prompt-helpers.ts
         lora_assertion_re = re.compile(r"<(lora|lyco):([a-zA-Z0-9_\./\\-]+):([0-9.]+)>")
 
         prompt_texts = [
@@ -143,24 +433,20 @@ class Capture:
         lora_weights = inputs_before_sampler_node.get(MetaField.LORA_STRENGTH_MODEL, [])
         lora_hashes = inputs_before_sampler_node.get(MetaField.LORA_MODEL_HASH, [])
 
-        # Parse LoRAs in prompt
         lora_names_from_prompt, lora_weights_from_prompt, lora_hashes_from_prompt = [], [], []
         if "<lora:" in prompt_joined:
             for text in prompt_texts:
                 for _, name, weight in re.findall(lora_assertion_re, text.replace("\n", " ").replace("\r", " ")):
                     lora_names_from_prompt.append(("prompt_parse", name))
                     lora_weights_from_prompt.append(("prompt_parse", float(weight)))
-
                     h = calc_lora_hash(name)
                     if h:
                         lora_hashes_from_prompt.append(("prompt_parse", h))
 
-        # Combine all sources
         all_names = lora_names + lora_names_from_prompt
         all_weights = lora_weights + lora_weights_from_prompt
         all_hashes = lora_hashes + lora_hashes_from_prompt
 
-        # Update the metadata fields with combined information
         inputs_before_sampler_node[MetaField.LORA_MODEL_NAME] = all_names
         inputs_before_sampler_node[MetaField.LORA_STRENGTH_MODEL] = all_weights
         inputs_before_sampler_node[MetaField.LORA_MODEL_HASH] = all_hashes
@@ -178,12 +464,10 @@ class Capture:
         for (hsh, weight), names in grouped.items():
             canonical = min(names, key=len)
             present = hsh.lower() in hashes_in_prompt
-
             if not present:
                 lora_strings.append(f"<lora:{canonical}:{weight}>")
             lora_hashes_list.append(f"{canonical}: {hsh}")
 
-        # Rewrite prompt with cleaned names
         updated_prompts = []
         if "<lora:" in prompt_joined:
             for text in prompt_texts:
@@ -198,73 +482,82 @@ class Capture:
         return lora_strings, lora_hashes_string, updated_prompts
 
     @classmethod
-    def gen_pnginfo_dict(cls, inputs_before_sampler_node, inputs_before_this_node, prompt, save_civitai_sampler=True):
+    def gen_pnginfo_dict(cls, inputs_before_sampler_node, inputs_before_this_node, prompt, save_civitai_sampler=True, batch_index=0):
         pnginfo = {}
 
         if not inputs_before_sampler_node:
             inputs_before_sampler_node = defaultdict(list)
             cls._collect_all_metadata(prompt, inputs_before_sampler_node)
 
+        # ── PATCH: resolve prompts from graph when capture missed them ───────
+        outputs = None
+        if hook.prompt_executer and hook.prompt_executer.caches:
+            raw_outputs = hook.prompt_executer.caches.outputs
+            outputs = (
+                raw_outputs
+                if hasattr(raw_outputs, "get_output_cache")
+                else OutputCacheCompat(raw_outputs)
+            )
+
+        current_positive = None
+        current_negative = None
+        pos_list = inputs_before_sampler_node.get(MetaField.POSITIVE_PROMPT, [])
+        neg_list = inputs_before_sampler_node.get(MetaField.NEGATIVE_PROMPT, [])
+        if pos_list:
+            current_positive = pos_list[0][1] if len(pos_list[0]) > 1 else None
+        if neg_list:
+            current_negative = neg_list[0][1] if len(neg_list[0]) > 1 else None
+
+        # If either prompt is missing or is just a link reference, re-resolve
+        if (not current_positive or _is_link(current_positive) or
+                not current_negative or _is_link(current_negative)):
+            graph_pos, graph_neg = _find_prompt_texts(prompt, outputs, batch_index=batch_index)
+            if graph_pos and (not current_positive or _is_link(current_positive)):
+                inputs_before_sampler_node[MetaField.POSITIVE_PROMPT] = [("graph", graph_pos)]
+            if graph_neg and (not current_negative or _is_link(current_negative)):
+                inputs_before_sampler_node[MetaField.NEGATIVE_PROMPT] = [("graph", graph_neg)]
+        # ─────────────────────────────────────────────────────────────────────
+
         def is_simple(value):
             return isinstance(value, (str, int, float, bool)) or value is None
-        
+
         def extract(meta_key, label, source=inputs_before_sampler_node):
-            """
-            Scan the list behind `meta_key` and return the first payload that:
-              1) is present (link has at least two elements),
-              2) is not None,
-              3) if it's a string, the string is not empty.
-            Once found, it stores the value in `pnginfo[label]` and exits early.
-            """
-            # Retrieve the list associated with `meta_key`; default to an empty list
             val_list = source.get(meta_key, [])
-            # Traverse the list in the original order (front to back)
             for link in val_list:
-                # Guard against malformed link entries with length < 2
                 if len(link) <= 1:
                     continue
                 candidate = link[1]
-                # Skip if None
                 if candidate is None:
                     continue
-                # If candidate is a string, skip empty ones
                 if isinstance(candidate, str):
                     if not candidate.strip():
                         continue
                 elif not is_simple(candidate):
-                    continue # Skip lists, dicts, etc.
-
+                    continue
                 value = str(candidate)
                 pnginfo[label] = value
                 return value
-
-            # No valid payload found
             return None
 
-        # Prompts
         positive = extract(MetaField.POSITIVE_PROMPT, "Positive prompt") or ""
         if not positive.strip():
             print_warning("Positive prompt is empty!")
 
         negative = extract(MetaField.NEGATIVE_PROMPT, "Negative prompt") or ""
         lora_strings, lora_hashes, updated_prompts = cls.get_lora_strings_and_hashes(inputs_before_sampler_node)
-        
-        # If there are LoRAs in the prompt, use the cleaned version of the prompt.
+
         if updated_prompts:
             positive = updated_prompts[0]
-            
-        # Append LoRA models to the positive prompt, which is required for the Civitai website to parse and apply LoRA weights.
-        # Format: <lora:Lora_Model_Name:weight_value>. Example: <lora:Lora_Name_00:0.6> <lora:Lora_Name_01:0.8>
+
         if lora_strings:
             positive += " " + " ".join(lora_strings)
 
         pnginfo["Positive prompt"] = positive.strip()
         pnginfo["Negative prompt"] = negative.strip()
 
-        # Sampling params
         if not extract(MetaField.STEPS, "Steps"):
             print_warning("Steps are empty, full metadata won't be added!")
-            return {}  # No sense in pnginfo without the Steps parameter, ref https://github.com/civitai/civitai/blob/7c8f3f3044218cf3b3d86bd9f49d12fc196ea1f6/src/utils/metadata/automatic.metadata.ts#L102C42-L102C47
+            return {}
 
         samplers = inputs_before_sampler_node.get(MetaField.SAMPLER_NAME)
         schedulers = inputs_before_sampler_node.get(MetaField.SCHEDULER)
@@ -279,13 +572,11 @@ class Capture:
 
         extract(MetaField.CFG, "CFG scale")
         extract(MetaField.SEED, "Seed")
-        
-        # Missing CLIP skip means it was set to 1 (the default)
+
         clip_skip = extract(MetaField.CLIP_SKIP, "Clip skip")
         if clip_skip is None:
             pnginfo["Clip skip"] = "1"
 
-        # Image size
         image_width_data = inputs_before_sampler_node.get(MetaField.IMAGE_WIDTH, [[None]])
         image_height_data = inputs_before_sampler_node.get(MetaField.IMAGE_HEIGHT, [[None]])
 
@@ -297,31 +588,25 @@ class Capture:
         if width and height:
             pnginfo["Size"] = f"{width}x{height}"
 
-        # Model details
         extract(MetaField.MODEL_NAME, "Model")
         extract(MetaField.MODEL_HASH, "Model hash")
         extract(MetaField.VAE_NAME, "VAE", inputs_before_this_node)
         extract(MetaField.VAE_HASH, "VAE hash", inputs_before_this_node)
 
-        # Denoising strength
         denoise = inputs_before_sampler_node.get(MetaField.DENOISE)
         dval = denoise[0][1] if denoise else None
         if dval and 0 < float(dval) < 1:
             pnginfo["Denoising strength"] = float(dval)
 
-        # Include upscale info if present
         if inputs_before_this_node.get(MetaField.UPSCALE_BY) or inputs_before_this_node.get(MetaField.UPSCALE_MODEL_NAME):
             pnginfo["Denoising strength"] = float(dval or 1.0)
 
-        # Hi-Res, based on https://github.com/civitai/civitai/blob/0c6a61b2d3ee341e77a357d4c08cf220e22b1190/src/server/common/model-helpers.ts#L33
         extract(MetaField.UPSCALE_BY, "Hires upscale", inputs_before_this_node)
         extract(MetaField.UPSCALE_MODEL_NAME, "Hires upscaler", inputs_before_this_node)
 
-        # Lora hashes, based on https://github.com/AUTOMATIC1111/stable-diffusion-webui/blob/82a973c04367123ae98bd9abdf80d9eda9b910e2/extensions-builtin/Lora/scripts/lora_script.py#L78
         if lora_hashes:
             pnginfo["Lora hashes"] = f'"{lora_hashes}"'
 
-        # Additional metadata
         pnginfo.update(cls.gen_loras(inputs_before_sampler_node))
         pnginfo.update(cls.gen_embeddings(inputs_before_sampler_node))
 
@@ -333,11 +618,20 @@ class Capture:
 
     @classmethod
     def _collect_all_metadata(cls, prompt, result_dict):
+        # ── PATCH: use the graph-walk resolver for prompt texts ───────────────
+        outputs = None
+        if hook.prompt_executer and hook.prompt_executer.caches:
+            raw_outputs = hook.prompt_executer.caches.outputs
+            outputs = (
+                raw_outputs
+                if hasattr(raw_outputs, "get_output_cache")
+                else OutputCacheCompat(raw_outputs)
+            )
+
         def _append_metadata(meta, node_id, value):
             if value is not None:
                 result_dict[meta].append((node_id, value, 0))
 
-        # Detect nodes with specific fields
         resolved = {
             "prompt": Trace.find_node_with_fields(prompt, {"positive", "negative"}),
             "denoise": Trace.find_node_with_fields(prompt, {"denoise"}),
@@ -346,7 +640,6 @@ class Capture:
             "model": Trace.find_node_with_fields(prompt, {"ckpt_name"}),
         }
 
-        # LoRA metadata (multiple)
         for node_id, node in Trace.find_all_nodes_with_fields(prompt, {"lora_name", "strength_model"}):
             if node is not None:
                 inputs = node.get("inputs", {})
@@ -356,7 +649,6 @@ class Capture:
                 _append_metadata(MetaField.LORA_MODEL_HASH, node_id, calc_lora_hash(name) if name else None)
                 _append_metadata(MetaField.LORA_STRENGTH_MODEL, node_id, strength)
 
-        # Model metadata
         model_node = resolved.get("model")
         if model_node and model_node[1] is not None:
             node_id, node = model_node
@@ -365,14 +657,12 @@ class Capture:
             _append_metadata(MetaField.MODEL_NAME, node_id, name)
             _append_metadata(MetaField.MODEL_HASH, node_id, calc_model_hash(name) if name else None)
 
-        # Denoise
         denoise_node = resolved.get("denoise")
         if denoise_node and denoise_node[1] is not None:
             node_id, node = denoise_node
             val = node.get("inputs", {}).get("denoise")
             _append_metadata(MetaField.DENOISE, node_id, val)
 
-        # Sampler fields
         sampler_node = resolved.get("sampler")
         if sampler_node and sampler_node[1] is not None:
             node_id, node = sampler_node
@@ -386,7 +676,6 @@ class Capture:
             }.items():
                 _append_metadata(meta, node_id, inputs.get(key))
 
-        # Image size fields
         size_node = resolved.get("size")
         if size_node and size_node[1] is not None:
             node_id, node = size_node
@@ -397,40 +686,89 @@ class Capture:
             }.items():
                 _append_metadata(meta, node_id, inputs.get(key))
 
-        # Prompt fields
-        for node_id, node in Trace.find_all_nodes_with_fields(prompt, {"positive", "negative"}):
-            if node is not None:
+        # ── PATCHED prompt resolution ─────────────────────────────────────────
+        # Only match nodes that look like samplers (have seed/steps/cfg etc.)
+        # to avoid accidentally matching ConditioningCombine or similar nodes
+        # that also have positive+negative keys but are NOT the sampler.
+        _SAMPLER_HINT_KEYS = {"seed", "steps", "cfg", "sampler_name", "noise_seed", "denoise"}
+        _SAMPLER_CLASSES = {
+            "KSampler", "KSamplerAdvanced", "SamplerCustom", "KSamplerSelect",
+            "KSampler_inspire", "KSamplerAdvancedPipe", "KSamplerPipe",
+            "FluxKSampler", "FluxSampler", "Sampler",
+        }
+
+        found_prompts = False
+        for node_id, node in prompt.items():
+            node_inputs = node.get("inputs", {})
+            class_type = node.get("class_type", "")
+
+            # Must have both conditioning keys
+            if "positive" not in node_inputs or "negative" not in node_inputs:
+                continue
+
+            # Must look like a sampler node — don't match conditioning utility nodes
+            is_sampler = (
+                class_type in _SAMPLER_CLASSES
+                or bool(_SAMPLER_HINT_KEYS & set(node_inputs.keys()))
+            )
+            if not is_sampler:
+                continue
+
+            pos_text = _follow_conditioning_to_clip_text(node_inputs.get("positive"), prompt, outputs, batch_index=0)
+            neg_text = _follow_conditioning_to_clip_text(node_inputs.get("negative"), prompt, outputs, batch_index=0)
+
+            if pos_text or neg_text:
+                if pos_text:
+                    _append_metadata(MetaField.POSITIVE_PROMPT, node_id, pos_text)
+                if neg_text:
+                    _append_metadata(MetaField.NEGATIVE_PROMPT, node_id, neg_text)
+
+                # Embeddings from resolved text
+                for text in (pos_text, neg_text):
+                    if not text:
+                        continue
+                    for emb_name, emb_hash in zip(
+                        extract_embedding_names(text), extract_embedding_hashes(text)
+                    ):
+                        _append_metadata(MetaField.EMBEDDING_NAME, node_id, emb_name)
+                        _append_metadata(MetaField.EMBEDDING_HASH, node_id, emb_hash)
+
+                found_prompts = True
+                break  # First sampler we find is enough
+
+        # Final fallback – old behaviour preserved for edge-cases
+        if not found_prompts:
+            for node_id, node in Trace.find_all_nodes_with_fields(prompt, {"positive", "negative"}):
+                if node is None:
+                    continue
                 inputs = node.get("inputs", {})
                 pos_ref = inputs.get("positive", [None])[0]
                 neg_ref = inputs.get("negative", [None])[0]
 
                 def resolve_text(ref):
-                    if isinstance(ref, list): ref = ref[0]
-                    if not isinstance(ref, str): return None
-                    node = prompt.get(ref)
-                    return node.get("inputs", {}).get("text") if node else None
+                    if isinstance(ref, list):
+                        ref = ref[0]
+                    if not isinstance(ref, str):
+                        return None
+                    n = prompt.get(ref)
+                    if n is None:
+                        return None
+                    raw = n.get("inputs", {}).get("text")
+                    if isinstance(raw, str):
+                        return raw
+                    return _resolve_text_from_graph(raw, prompt, outputs)
 
                 pos_text = resolve_text(pos_ref)
                 neg_text = resolve_text(neg_ref)
-                
-                # Append positive and negative prompts
                 _append_metadata(MetaField.POSITIVE_PROMPT, pos_ref, pos_text)
                 _append_metadata(MetaField.NEGATIVE_PROMPT, neg_ref, neg_text)
 
-                # Add embedding metadata collection
-                if pos_text:
-                    embedding_names = extract_embedding_names(pos_text)
-                    embedding_hashes = extract_embedding_hashes(pos_text)
-                    for name, hash_ in zip(embedding_names, embedding_hashes):
+                for text in (pos_text, neg_text):
+                    if not text:
+                        continue
+                    for name, h in zip(extract_embedding_names(text), extract_embedding_hashes(text)):
                         _append_metadata(MetaField.EMBEDDING_NAME, node_id, name)
-                        _append_metadata(MetaField.EMBEDDING_HASH, node_id, hash_)
-
-                if neg_text:
-                    embedding_names = extract_embedding_names(neg_text)
-                    embedding_hashes = extract_embedding_hashes(neg_text)
-                    for name, hash_ in zip(embedding_names, embedding_hashes):
-                        _append_metadata(MetaField.EMBEDDING_NAME, node_id, name)
-                        _append_metadata(MetaField.EMBEDDING_HASH, node_id, hash_)
+                        _append_metadata(MetaField.EMBEDDING_HASH, node_id, h)
 
     @classmethod
     def extract_model_info(cls, inputs, meta_field_name, prefix):
@@ -506,7 +844,7 @@ class Capture:
         vae = extract_single(inputs_before_this_node, MetaField.VAE_HASH)
         if vae:
             resource_hashes["vae"] = vae
-            
+
         upscaler_hash = extract_single(inputs_before_this_node, MetaField.UPSCALE_MODEL_HASH)
         if upscaler_hash:
             resource_hashes["upscaler"] = upscaler_hash
@@ -528,20 +866,9 @@ class Capture:
     @classmethod
     def get_sampler_for_civitai(cls, sampler_names, schedulers):
         """
-        Get the pretty sampler name for Civitai in the form of `<Sampler Name> <Scheduler name>`.
-            - `dpmpp_2m` and `karras` will return `DPM++ 2M Karras`
-        
-        If there is a matching sampler name but no matching scheduler name, return only the matching sampler name.
-            - `dpmpp_2m` and `exponential` will return only `DPM++ 2M`
-
-        if there is no matching sampler and scheduler name, return `<sampler_name>_<scheduler_name>`
-            - `ipndm` and `normal` will return `ipndm`
-            - `ipndm` and `karras` will return `ipndm_karras`
-
+        Get the pretty sampler name for Civitai.
         Reference: https://github.com/civitai/civitai/blob/main/src/server/common/constants.ts
         """
-
-        # Sampler map: https://github.com/civitai/civitai/blob/fe76d9a4406d0c7b6f91f7640c50f0a8fa1b9f35/src/server/common/constants.ts#L699
         sampler_dict = {
             'euler': 'Euler',
             'euler_ancestral': 'Euler a',
@@ -552,13 +879,11 @@ class Capture:
             'dpm_fast': 'DPM fast',
             'dpm_adaptive': 'DPM adaptive',
             'dpmpp_2s_ancestral': 'DPM++ 2S a',
-            
             'dpmpp_sde': 'DPM++ SDE',
             'dpmpp_sde_gpu': 'DPM++ SDE',
             'dpmpp_2m': 'DPM++ 2M',
             'dpmpp_2m_sde': 'DPM++ 2M SDE',
             'dpmpp_2m_sde_gpu': 'DPM++ 2M SDE',
-            
             'ddim': 'DDIM',
             'plms': 'PLMS',
             'uni_pc': 'UniPC',
@@ -568,15 +893,11 @@ class Capture:
 
         sampler = None
         scheduler = None
-        
-        # Get the sampler and scheduler values
-        if sampler_names:
-            if len(sampler_names) > 0:
-                sampler = sampler_names[0][1]
-                
-        if schedulers:
-            if len(schedulers) > 0:
-                scheduler = schedulers[0][1]
+
+        if sampler_names and len(sampler_names) > 0:
+            sampler = sampler_names[0][1]
+        if schedulers and len(schedulers) > 0:
+            scheduler = schedulers[0][1]
 
         def get_scheduler_name(sampler_name, scheduler):
             if scheduler == "karras":
@@ -590,9 +911,8 @@ class Capture:
 
         if not sampler:
             return None
-    
+
         if sampler in sampler_dict:
             return get_scheduler_name(sampler_dict[sampler], scheduler)
 
-        # If no match in the dictionary, return the sampler name with scheduler appended
         return get_scheduler_name(sampler, scheduler)
