@@ -4,7 +4,7 @@
 
 Custom node for [ComfyUI](https://github.com/comfyanonymous/ComfyUI). It adds additional metadata for saved images, ensuring compatibility with the Civitai website.
 
-*This is a fork of [nkchocoai/ComfyUI-SaveImageWithMetaData](https://github.com/nkchocoai/ComfyUI-SaveImageWithMetaData).*
+*This is a fork of [edelvarden/comfyui_image_metadata_extension](https://github.com/edelvarden/comfyui_image_metadata_extension) since it seems that edelvarden is no longer activally updating the node*
 
 **Key differences:**
 - Simplified the node by removing unnecessary fields for general use.
@@ -34,7 +34,7 @@ Custom node for [ComfyUI](https://github.com/comfyanonymous/ComfyUI). It adds ad
 Use the [ComfyUI-Manager](https://github.com/ltdrdata/ComfyUI-Manager) to install.
 
 ```
-comfyui_image_metadata_extension
+revived_comfyui_image_metadata_extension
 ```
 
 ### Manual Installation
@@ -43,7 +43,7 @@ comfyui_image_metadata_extension
 2. Clone this repository:
 
   ```bash
-   git clone https://github.com/edelvarden/comfyui_image_metadata_extension.git
+   git clone https://github.com/Santodan/revived_comfyui_image_metadata_extension.git
   ```
 
 ## Usage
