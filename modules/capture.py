@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import os
 import re
@@ -38,6 +39,47 @@ _resolved_node_texts: dict = {}
 
 def _clear_resolved_texts():
     _resolved_node_texts.clear()
+
+
+def _coerce_text_value(value, batch_index=0):
+    if isinstance(value, str):
+        return value if value.strip() else None
+    if isinstance(value, (list, tuple)):
+        text_items = [item for item in value if isinstance(item, str) and item.strip()]
+        if not text_items:
+            return None
+        idx = min(batch_index, len(text_items) - 1)
+        return text_items[idx]
+    return None
+
+
+_UNRESOLVED_PROMPT_PATTERNS = (
+    re.compile(r"__[\w./\\-]+__"),
+    re.compile(r"\{\d+\$\$"),
+)
+
+
+def _looks_unresolved_prompt_text(value):
+    text = _coerce_text_value(value)
+    if not text:
+        return False
+    return any(pattern.search(text) for pattern in _UNRESOLVED_PROMPT_PATTERNS)
+
+
+def _should_prefer_graph_prompt(current_value, graph_value):
+    current_text = _coerce_text_value(current_value)
+    graph_text = _coerce_text_value(graph_value)
+    if not graph_text:
+        return False
+    if not current_text or _is_link(current_value):
+        return True
+    if current_text == graph_text:
+        return False
+    return _looks_unresolved_prompt_text(current_text) and not _looks_unresolved_prompt_text(graph_text)
+
+
+def _needs_graph_prompt_resolution(value):
+    return not _coerce_text_value(value) or _is_link(value) or _looks_unresolved_prompt_text(value)
 
 
 # ---------------------------------------------------------------------------
@@ -131,8 +173,11 @@ def _resolve_text_from_graph(value, prompt, outputs, _visited=None, batch_index=
     # ── 1. Runtime interception cache (populated by HierarchicalCache.set patch) ────────
     # Check slot-specific key first, then plain node_id key.
     slot_key = f"{node_id}:{out_slot}"
-    cached_text = _resolved_node_texts.get(slot_key) or _resolved_node_texts.get(node_id)
-    if cached_text and isinstance(cached_text, str) and cached_text.strip():
+    cached_text = _coerce_text_value(
+        _resolved_node_texts.get(slot_key) or _resolved_node_texts.get(node_id),
+        batch_index=batch_index,
+    )
+    if cached_text:
         return cached_text
 
     # ── 2. Walk the graph node ───────────────────────────────────────────────
@@ -143,28 +188,16 @@ def _resolve_text_from_graph(value, prompt, outputs, _visited=None, batch_index=
     node_inputs = node.get("inputs", {})
     class_type = node.get("class_type", "").lower()
 
-    # Direct text field on this node (e.g. CLIPTextEncode whose "text" is
-    # a hard-coded string, or a primitive String node).
-    for key in ("text", "string", "value", "val", "prompt",
-                "positive_prompt", "negative_prompt"):
-        raw = node_inputs.get(key)
-        if raw is None:
-            continue
-        if isinstance(raw, str) and raw.strip():
-            return raw
-        if _is_link(raw):
-            resolved = _resolve_text_from_graph(raw, prompt, outputs, _visited)
-            if resolved:
-                return resolved
-
-    # ── 3. Concatenation / joining nodes ────────────────────────────────────
     is_concat = any(hint in class_type for hint in _CONCAT_CLASS_HINTS)
     if is_concat:
+        def _concat_sort_key(key):
+            match = re.search(r'\d+', key)
+            return (re.sub(r'\d+', '', key), int(match.group()) if match else 0)
+
         # Collect all text-like input keys in stable order.
         candidate_keys = sorted(
             (k for k in node_inputs if any(h in k.lower() for h in _TEXT_KEY_HINTS)),
-            key=lambda k: (re.sub(r'\d+', '', k),
-                           int(re.search(r'\d+', k).group()) if re.search(r'\d+', k) else 0)
+            key=_concat_sort_key,
         )
         parts = []
         for k in candidate_keys:
@@ -177,7 +210,7 @@ def _resolve_text_from_graph(value, prompt, outputs, _visited=None, batch_index=
             sep = sep_raw.replace("\\n", "\n") if isinstance(sep_raw, str) else " "
             return sep.join(parts)
 
-    # ── 4. Known dynamic text-generator nodes ───────────────────────────────
+            # ── 3. Known dynamic text-generator nodes ───────────────────────────────
     # These nodes compute their output at execution time (wildcard expansion,
     # random LoRA selection, etc.).  We fall back to their best static input
     # as an approximation rather than returning nothing.
@@ -194,6 +227,22 @@ def _resolve_text_from_graph(value, prompt, outputs, _visited=None, batch_index=
                     if resolved:
                         return resolved
             break  # matched a dynamic node — don't fall through to generic scan
+
+    # ── 4. Direct text field on this node ───────────────────────────────────
+    # Leave this after concat/dynamic handling so raw upstream inputs do not
+    # override the node's actual composed output text.
+    for key in ("text", "string", "value", "val", "prompt",
+                "positive_prompt", "negative_prompt"):
+        raw = node_inputs.get(key)
+        if raw is None:
+            continue
+        text_value = _coerce_text_value(raw, batch_index=batch_index)
+        if text_value:
+            return text_value
+        if _is_link(raw):
+            resolved = _resolve_text_from_graph(raw, prompt, outputs, _visited, batch_index)
+            if resolved:
+                return resolved
 
     # ── 5. Fallback: scan only text-hinted input keys, never model/clip/vae ──
     # IMPORTANT: skip nodes already matched as dynamic to prevent infinite loops
@@ -230,7 +279,7 @@ def _resolve_clip_text_encode_prompt(node_id, prompt, outputs, batch_index=0):
     # ── 1. Runtime-resolved text (populated by await get_input_data) ─────────
     # This is the only reliable source when "text" is wired from a dynamic
     # node (WildcardManager, StringConcatenate, etc.).
-    cached_text = _resolved_node_texts.get(nid)
+    cached_text = _coerce_text_value(_resolved_node_texts.get(nid), batch_index=batch_index)
     if cached_text:
         return cached_text
 
@@ -451,6 +500,7 @@ class Capture:
         from comfy_execution.graph import DynamicPrompt
 
         _clear_resolved_texts()
+        _resolved_node_texts.update(getattr(hook, "current_resolved_texts", {}))
         # Reset save-node id so it gets re-detected for every generation.
         # (Replaces the old pre_get_input_data hook which no longer fires.)
         hook.current_save_image_node_id = -1
@@ -492,9 +542,7 @@ class Capture:
                         if not isinstance(_entry_outputs, (list, tuple)):
                             continue
                         for _si, _sv in enumerate(_entry_outputs):
-                            if isinstance(_sv, list) and len(_sv) == 1:
-                                _sv = _sv[0]
-                            if isinstance(_sv, str) and _sv.strip():
+                            if _coerce_text_value(_sv) is not None:
                                 _resolved_node_texts[f"{_nid}:{_si}"] = _sv
                                 if str(_nid) not in _resolved_node_texts:
                                     _resolved_node_texts[str(_nid)] = _sv
@@ -515,8 +563,8 @@ class Capture:
                 hook.current_save_image_node_id = node_id
 
             # get_input_data is async in ComfyUI 0.3.68+ — await it.
+            input_data = [{}]
             try:
-                import inspect
                 # execution_list is the caches object in new ComfyUI.
                 # Try caches first, then None, then raw_outputs (old ComfyUI).
                 _caches = getattr(hook.prompt_executer, "caches", None)
@@ -526,7 +574,7 @@ class Capture:
                             node_inputs, obj_class, node_id, _exec_arg,
                             DynamicPrompt(prompt), extra_data
                         )
-                        if asyncio.iscoroutine(input_data) or hasattr(input_data, "__await__"):
+                        if inspect.isawaitable(input_data):
                             input_data = await input_data
                         # Check if we got a real resolved value for linked inputs
                         _dbg = input_data[0] if isinstance(input_data, (list,tuple)) and input_data else {}
@@ -563,9 +611,7 @@ class Capture:
                                     _src_outputs = getattr(_cr, "outputs", None)
                                     if isinstance(_src_outputs, (list, tuple)) and len(_src_outputs) > _src_slot:
                                         _slot = _src_outputs[_src_slot]
-                                        if isinstance(_slot, list) and len(_slot) == 1:
-                                            _slot = _slot[0]
-                                        if isinstance(_slot, str) and _slot.strip():
+                                        if _coerce_text_value(_slot) is not None:
                                             _resolved_node_texts[str(node_id)] = _slot
                         except Exception:
                             pass
@@ -591,9 +637,7 @@ class Capture:
                         if not isinstance(_entry_outputs, (list, tuple)):
                             continue
                         for _si, _sv in enumerate(_entry_outputs):
-                            if isinstance(_sv, list) and len(_sv) == 1:
-                                _sv = _sv[0]
-                            if isinstance(_sv, str) and _sv.strip():
+                            if _coerce_text_value(_sv) is not None:
                                 _resolved_node_texts[f"{_entry_nid}:{_si}"] = _sv
                                 if _entry_nid not in _resolved_node_texts:
                                     _resolved_node_texts[_entry_nid] = _sv
@@ -606,9 +650,8 @@ class Capture:
                 for _tkey in ("text", "string", "value", "prompt",
                               "positive_prompt", "negative_prompt"):
                     _tv = _rd.get(_tkey)
-                    if isinstance(_tv, list) and _tv:
-                        _tv = _tv[0]
-                    if isinstance(_tv, str) and _tv.strip():
+                    _tv = _coerce_text_value(_tv)
+                    if _tv:
                         if _rid not in _resolved_node_texts:
                             _resolved_node_texts[_rid] = _tv
                         break
@@ -768,13 +811,14 @@ class Capture:
         if neg_list:
             current_negative = neg_list[0][1] if len(neg_list[0]) > 1 else None
 
-        # If either prompt is missing or is just a link reference, re-resolve
-        if (not current_positive or _is_link(current_positive) or
-                not current_negative or _is_link(current_negative)):
+        # If either prompt is missing, linked, or still contains unresolved
+        # wildcard syntax, re-resolve from the active sampler/conditioning path.
+        if (_needs_graph_prompt_resolution(current_positive) or
+            _needs_graph_prompt_resolution(current_negative)):
             graph_pos, graph_neg = _find_prompt_texts(prompt, outputs, batch_index=batch_index)
-            if graph_pos and (not current_positive or _is_link(current_positive)):
+            if graph_pos and _should_prefer_graph_prompt(current_positive, graph_pos):
                 inputs_before_sampler_node[MetaField.POSITIVE_PROMPT] = [("graph", graph_pos)]
-            if graph_neg and (not current_negative or _is_link(current_negative)):
+            if graph_neg and _should_prefer_graph_prompt(current_negative, graph_neg):
                 inputs_before_sampler_node[MetaField.NEGATIVE_PROMPT] = [("graph", graph_neg)]
         # ─────────────────────────────────────────────────────────────────────
 
