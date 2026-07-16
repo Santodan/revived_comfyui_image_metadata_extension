@@ -762,21 +762,33 @@ class Capture:
         inputs_before_sampler_node[MetaField.LORA_MODEL_HASH] = all_hashes
 
         grouped = defaultdict(list)
-        for name, weight, hsh in zip(all_names, all_weights, all_hashes):
-            if not (name and weight and hsh):
+        for index, (name, weight) in enumerate(zip(all_names, all_weights)):
+            if not (name and weight):
                 continue
-            grouped[(hsh[1], weight[1])].append(clean_name(name[1]))
+
+            cleaned_name = clean_name(name[1])
+            hsh = all_hashes[index] if index < len(all_hashes) else None
+            hash_value = hsh[1] if hsh and len(hsh) > 1 and hsh[1] else None
+
+            # A failed hash lookup must not discard otherwise valid LoRA
+            # metadata.  Include the cleaned name in the grouping key when no
+            # hash is available so unrelated LoRAs with equal weights are not
+            # accidentally merged.
+            group_id = hash_value or f"__name__:{cleaned_name}"
+            grouped[(group_id, weight[1])].append(cleaned_name)
 
         hashes_in_prompt = {h[1].lower() for h in lora_hashes_from_prompt}
 
         lora_strings, lora_hashes_list = [], []
 
-        for (hsh, weight), names in grouped.items():
+        for (group_id, weight), names in grouped.items():
             canonical = min(names, key=len)
-            present = hsh.lower() in hashes_in_prompt
+            hsh = None if group_id.startswith("__name__:") else group_id
+            present = bool(hsh and hsh.lower() in hashes_in_prompt)
             if not present:
                 lora_strings.append(f"<lora:{canonical}:{weight}>")
-            lora_hashes_list.append(f"{canonical}: {hsh}")
+            if hsh:
+                lora_hashes_list.append(f"{canonical}: {hsh}")
 
         updated_prompts = []
         if "<lora:" in prompt_joined:
@@ -800,6 +812,39 @@ class Capture:
             cls._collect_all_metadata(prompt, inputs_before_sampler_node)
 
         # ── PATCH: resolve prompts from graph when capture missed them ───────
+        # LoraMetadataHub carries dynamic STRING inputs which recent ComfyUI
+        # cache/trace combinations can omit from the normal capture result.
+        # Recover it directly from the prompt after trace filtering.
+        if not inputs_before_sampler_node.get(MetaField.LORA_MODEL_NAME):
+            try:
+                from .defs.ext.SantodanNodes import parse_lora_hub_data
+
+                for hub_node_id, hub_obj in prompt.items():
+                    if hub_obj.get("class_type") != "LoraMetadataHub":
+                        continue
+                    hub_data = parse_lora_hub_data(
+                        hub_node_id, hub_obj, prompt, hook.current_extra_data,
+                        _get_outputs_cache(), [{}]
+                    )
+                    for item in hub_data:
+                        name = item.get("name")
+                        strength = item.get("strength")
+                        if not name or strength is None:
+                            continue
+                        inputs_before_sampler_node[MetaField.LORA_MODEL_NAME].append(
+                            (hub_node_id, name)
+                        )
+                        inputs_before_sampler_node[MetaField.LORA_STRENGTH_MODEL].append(
+                            (hub_node_id, strength)
+                        )
+                        lora_hash = calc_lora_hash(name)
+                        if lora_hash:
+                            inputs_before_sampler_node[MetaField.LORA_MODEL_HASH].append(
+                                (hub_node_id, lora_hash)
+                            )
+            except Exception as e:
+                print_warning(f"Could not recover LoraMetadataHub data: {e}")
+
         outputs = _get_outputs_cache()
 
         current_positive = None

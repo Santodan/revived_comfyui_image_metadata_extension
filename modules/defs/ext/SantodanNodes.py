@@ -76,7 +76,18 @@ def _get_hub_combined_string(node_id, obj, prompt, extra_data, outputs, input_da
     Fallback: parse loras_X inputs from input_data (works when inputs are
     hardcoded strings, not links).
     """
-    # Primary: use the resolved output string from the cache
+    # Primary: retrieve the exact runtime value recorded by the hub itself.
+    # This is independent of ComfyUI's execution-cache implementation.
+    try:
+        from nodes import NODE_CLASS_MAPPINGS
+        hub_class = NODE_CLASS_MAPPINGS.get("LoraMetadataHub")
+        combined = getattr(hub_class, "runtime_loras", {}).get(str(node_id))
+        if combined and isinstance(combined, str):
+            return combined
+    except Exception:
+        pass
+
+    # Fallback: use the resolved output string from the cache
     try:
         from ...capture import _resolved_node_texts
         nid = str(node_id)
@@ -93,16 +104,56 @@ def _get_hub_combined_string(node_id, obj, prompt, extra_data, outputs, input_da
     except Exception:
         pass
 
-    # Fallback: parse loras_X from input_data (hardcoded inputs only)
+    def clean_text(value):
+        if isinstance(value, str):
+            value = value.strip()
+            return value if value and value.lower() != "none" else None
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                cleaned = clean_text(item)
+                if cleaned:
+                    return cleaned
+        return None
+
+    # Fallback 1: resolved values returned by get_input_data.
     inputs = input_data[0] if input_data else {}
     parts = []
     for i in range(1, 4):
-        val = inputs.get(f"loras_{i}", "")
-        if isinstance(val, list):
-            val = val[0] if val else ""
-        if val and isinstance(val, str) and val.strip().lower() != "none":
-            parts.append(val.strip())
-    return ", ".join(filter(None, parts)) or None
+        val = clean_text(inputs.get(f"loras_{i}"))
+        if val:
+            parts.append(val)
+    if parts:
+        return ", ".join(parts)
+
+    # Fallback 2: follow the hub's raw graph links to the runtime output slots
+    # of RandomLoRA nodes.  Current ComfyUI may not expose linked optional
+    # STRING inputs through get_input_data, while the source outputs are still
+    # present in the metadata extension's runtime text cache.
+    try:
+        from ...capture import _resolved_node_texts
+        hub_inputs = obj.get("inputs", {}) if isinstance(obj, dict) else {}
+        for i in range(1, 4):
+            raw = hub_inputs.get(f"loras_{i}")
+            val = None
+            if (
+                isinstance(raw, (list, tuple))
+                and len(raw) >= 2
+                and isinstance(raw[0], (str, int))
+                and isinstance(raw[1], int)
+            ):
+                source_id, source_slot = str(raw[0]), raw[1]
+                val = clean_text(
+                    _resolved_node_texts.get(f"{source_id}:{source_slot}")
+                    or _resolved_node_texts.get(source_id)
+                )
+            else:
+                val = clean_text(raw)
+            if val:
+                parts.append(val)
+    except Exception:
+        pass
+
+    return ", ".join(parts) or None
 
 
 def parse_lora_hub_data(node_id, obj, prompt, extra_data, outputs, input_data):
